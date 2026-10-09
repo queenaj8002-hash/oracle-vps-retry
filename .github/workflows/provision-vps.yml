@@ -1,4 +1,3 @@
-
 name: Provision Oracle VPS
 
 on:
@@ -29,7 +28,6 @@ jobs:
         run: |
           mkdir -p "$HOME/.oci"
           chmod 700 "$HOME/.oci"
-
           printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
 
@@ -41,25 +39,28 @@ jobs:
           region=$OCI_REGION
           key_file=$HOME/.oci/oci_api_key.pem
           EOF
-
           chmod 600 "$HOME/.oci/config"
+
           oci iam availability-domain list \
             --compartment-id "$OCI_TENANCY_OCID" \
             --output table
 
-      - name: Check and provision VPS
+      - name: Check existing instance
+        id: check
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
-          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
-          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          echo "Memeriksa instance yang sudah ada..."
           oci compute instance list \
             --compartment-id "$OCI_TENANCY_OCID" \
             --all --output json > instances.json
+
+          echo "Jumlah instance dalam respons OCI:"
+          jq '.data | length' instances.json
+
+          echo "Nama instance yang ditemukan:"
+          jq -r '.data[]? | ."display-name"' instances.json
 
           if jq -e '
             .data[]? |
@@ -69,11 +70,21 @@ jobs:
               ."lifecycle-state" != "TERMINATING"
             )
           ' instances.json > /dev/null; then
-            echo "hermes-vps sudah ada. Tidak membuat duplikat."
-            exit 0
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Instance hermes-vps benar-benar ditemukan."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Instance hermes-vps tidak ditemukan."
           fi
 
-          echo "Mencari image Ubuntu 24.04 untuk A1 Flex..."
+      - name: Find Ubuntu 24.04 image
+        id: image
+        if: steps.check.outputs.exists == 'false'
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          set -euo pipefail
+
           IMAGE_ID=$(oci compute image list \
             --compartment-id "$OCI_TENANCY_OCID" \
             --operating-system "Canonical Ubuntu" \
@@ -85,10 +96,24 @@ jobs:
             --query 'data[0].id' \
             --raw-output)
 
-          if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "None" ]]; then
-            echo "Image Ubuntu yang sesuai tidak ditemukan."
+          if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "None" || "$IMAGE_ID" == "null" ]]; then
+            echo "Image Ubuntu 24.04 yang sesuai tidak ditemukan."
             exit 1
           fi
+
+          echo "image_id=$IMAGE_ID" >> "$GITHUB_OUTPUT"
+          echo "Image Ubuntu yang sesuai ditemukan."
+
+      - name: Try to create VPS
+        if: steps.check.outputs.exists == 'false'
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          IMAGE_ID: ${{ steps.image.outputs.image_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh_public_key"
           chmod 600 "$RUNNER_TEMP/ssh_public_key"
@@ -100,7 +125,7 @@ jobs:
           )
 
           for AD in "${ADS[@]}"; do
-            echo "Mencoba membuat VPS di $AD..."
+            echo "Mencoba Availability Domain: $AD"
 
             if oci compute instance launch \
               --availability-domain "$AD" \
@@ -115,8 +140,7 @@ jobs:
               --wait-for-state RUNNING \
               --max-wait-seconds 900 \
               --output json > launch-result.json 2> launch-error.log; then
-
-              echo "Instance berhasil dibuat:"
+              echo "VPS berhasil dibuat."
               jq '{
                 id: .data.id,
                 name: .data."display-name",
@@ -131,7 +155,7 @@ jobs:
               if ! grep -Eqi \
                 'out of host capacity|capacity.*unavailable|not available in.*availability domain' \
                 launch-error.log; then
-                echo "Kesalahan bukan masalah kapasitas yang dikenali. Menghentikan proses untuk pemeriksaan."
+                echo "Kesalahan bukan masalah kapasitas yang dikenali."
                 exit 1
               fi
             fi
@@ -139,3 +163,7 @@ jobs:
 
           echo "Kapasitas A1 belum tersedia di ketiga AD."
           exit 1
+
+      - name: VPS already exists
+        if: steps.check.outputs.exists == 'true'
+        run: echo "hermes-vps sudah ada. Tidak membuat duplikat."
