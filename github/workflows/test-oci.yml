@@ -1,0 +1,44 @@
+
+name: Test Oracle Connection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-oci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Configure OCI credentials
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_KEY_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.oci"
+          printf '%s' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_KEY_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+
+          chmod 600 "$HOME/.oci/config"
+
+      - name: Test Oracle API
+        run: |
+          oci iam availability-domain list \
+            --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" \
+            --output table
