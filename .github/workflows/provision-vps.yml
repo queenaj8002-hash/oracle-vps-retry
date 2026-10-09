@@ -2,6 +2,8 @@ name: Provision Oracle VPS
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
@@ -28,7 +30,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "$HOME/.oci"
           chmod 700 "$HOME/.oci"
 
@@ -45,7 +46,6 @@ jobs:
           EOF
 
           chmod 600 "$HOME/.oci/config"
-
           echo "Memeriksa koneksi dan region OCI..."
           oci iam availability-domain list \
             --compartment-id "$OCI_TENANCY_OCID" \
@@ -75,34 +75,29 @@ jobs:
           echo "Jumlah instance yang ditemukan: $COUNT"
 
           echo "Nama dan status instance:"
-          jq -r '
-            .data[]? |
-            [
-              (."display-name" // "(tanpa nama)"),
-              (."lifecycle-state" // "(status tidak diketahui)"),
-              (.id // "(OCID tidak tersedia)")
-            ] | @tsv
-          ' instances.json
+          jq -r '.data[]? | [
+            (."display-name" // "(tanpa nama)"),
+            (."lifecycle-state" // "(status tidak diketahui)"),
+            (.id // "(OCID tidak tersedia)")
+          ] | @tsv' instances.json
 
-          MATCH=$(jq -r '
-            [
-              .data[]? |
-              select(
-                ."display-name" == "hermes-vps" and
-                ."lifecycle-state" != "TERMINATED" and
-                ."lifecycle-state" != "TERMINATING"
+          MATCH=$(jq -r '[
+            .data[]?
+            | select(
+                ."display-name" == "hermes-vps"
+                and ."lifecycle-state" != "TERMINATED"
+                and ."lifecycle-state" != "TERMINATING"
               )
-            ] | length
-          ' instances.json)
+          ] | length' instances.json)
 
           if [[ "$MATCH" -gt 0 ]]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Instance hermes-vps ditemukan oleh API OCI."
-            echo "Pembuatan instance baru akan dilewati untuk mencegah duplikat."
+            echo "Instance hermes-vps ditemukan."
+            echo "Pembuatan instance baru dilewati untuk mencegah duplikat."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Instance hermes-vps tidak ditemukan oleh API OCI."
-            echo "Workflow akan melanjutkan pemeriksaan image."
+            echo "Instance hermes-vps belum ditemukan."
+            echo "Melanjutkan pemeriksaan image."
           fi
 
       - name: Find Ubuntu 24.04 image
@@ -115,7 +110,6 @@ jobs:
           set -euo pipefail
 
           echo "Mencari image Ubuntu 24.04 untuk VM.Standard.A1.Flex..."
-
           oci compute image list \
             --compartment-id "$OCI_TENANCY_OCID" \
             --operating-system "Canonical Ubuntu" \
@@ -129,19 +123,13 @@ jobs:
             exit 1
           fi
 
-          IMAGE_ID=$(jq -r '
-            [
-              .data[]? |
-              select(.id != null)
-            ] |
-            sort_by(."time-created" // "") |
-            last |
-            .id // empty
-          ' images.json)
+          IMAGE_ID=$(jq -r '[
+            .data[]?
+            | select(.id != null)
+          ] | sort_by(."time-created" // "") | last | .id // empty' images.json)
 
           if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "null" ]]; then
-            echo "ERROR: Tidak menemukan image Ubuntu 24.04 yang cocok."
-            echo "Periksa ketersediaan image dan parameter filter OCI."
+            echo "ERROR: Image Ubuntu 24.04 yang cocok tidak ditemukan."
             exit 1
           fi
 
@@ -160,7 +148,7 @@ jobs:
           set -euo pipefail
 
           if [[ -z "$OCI_SSH_PUBLIC_KEY" || -z "$OCI_SUBNET_OCID" ]]; then
-            echo "ERROR: Secret SSH public key atau subnet kosong."
+            echo "ERROR: SSH public key atau subnet kosong."
             exit 1
           fi
 
@@ -218,6 +206,6 @@ jobs:
       - name: VPS already exists
         if: steps.check.outputs.exists == 'true'
         run: |
-          echo "Instance sudah ditemukan melalui API OCI."
+          echo "Instance hermes-vps sudah ditemukan melalui API OCI."
           echo "Tidak membuat instance duplikat."
           echo "Periksa OCID dan status pada log Check existing instance."
