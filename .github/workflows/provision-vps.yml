@@ -9,7 +9,7 @@ permissions:
 jobs:
   provision:
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Install OCI CLI and jq
@@ -25,9 +25,13 @@ jobs:
           OCI_KEY_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p "$HOME/.oci"
           chmod 700 "$HOME/.oci"
+
           printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
 
@@ -39,8 +43,10 @@ jobs:
           region=$OCI_REGION
           key_file=$HOME/.oci/oci_api_key.pem
           EOF
+
           chmod 600 "$HOME/.oci/config"
 
+          echo "Memeriksa koneksi dan region OCI..."
           oci iam availability-domain list \
             --compartment-id "$OCI_TENANCY_OCID" \
             --output table
@@ -49,32 +55,54 @@ jobs:
         id: check
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+        shell: bash
         run: |
           set -euo pipefail
 
+          echo "Mengambil daftar instance dari OCI..."
           oci compute instance list \
             --compartment-id "$OCI_TENANCY_OCID" \
-            --all --output json > instances.json
+            --all \
+            --output json > instances.json
 
-          echo "Jumlah instance dalam respons OCI:"
-          jq '.data | length' instances.json
+          echo "Memvalidasi respons OCI..."
+          if ! jq -e '(.data | type) == "array"' instances.json >/dev/null; then
+            echo "ERROR: Respons OCI bukan daftar instance yang valid."
+            exit 1
+          fi
 
-          echo "Nama instance yang ditemukan:"
-          jq -r '.data[]? | ."display-name"' instances.json
+          COUNT=$(jq '.data | length' instances.json)
+          echo "Jumlah instance yang ditemukan: $COUNT"
 
-          if jq -e '
+          echo "Nama dan status instance:"
+          jq -r '
             .data[]? |
-            select(
-              ."display-name" == "hermes-vps" and
-              ."lifecycle-state" != "TERMINATED" and
-              ."lifecycle-state" != "TERMINATING"
-            )
-          ' instances.json > /dev/null; then
+            [
+              (."display-name" // "(tanpa nama)"),
+              (."lifecycle-state" // "(status tidak diketahui)"),
+              (.id // "(OCID tidak tersedia)")
+            ] | @tsv
+          ' instances.json
+
+          MATCH=$(jq -r '
+            [
+              .data[]? |
+              select(
+                ."display-name" == "hermes-vps" and
+                ."lifecycle-state" != "TERMINATED" and
+                ."lifecycle-state" != "TERMINATING"
+              )
+            ] | length
+          ' instances.json)
+
+          if [[ "$MATCH" -gt 0 ]]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Instance hermes-vps benar-benar ditemukan."
+            echo "Instance hermes-vps ditemukan oleh API OCI."
+            echo "Pembuatan instance baru akan dilewati untuk mencegah duplikat."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Instance hermes-vps tidak ditemukan."
+            echo "Instance hermes-vps tidak ditemukan oleh API OCI."
+            echo "Workflow akan melanjutkan pemeriksaan image."
           fi
 
       - name: Find Ubuntu 24.04 image
@@ -82,27 +110,43 @@ jobs:
         if: steps.check.outputs.exists == 'false'
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          IMAGE_ID=$(oci compute image list \
+          echo "Mencari image Ubuntu 24.04 untuk VM.Standard.A1.Flex..."
+
+          oci compute image list \
             --compartment-id "$OCI_TENANCY_OCID" \
             --operating-system "Canonical Ubuntu" \
             --operating-system-version "24.04" \
             --shape "VM.Standard.A1.Flex" \
-            --sort-by TIMECREATED \
-            --sort-order DESC \
             --all \
-            --query 'data[0].id' \
-            --raw-output)
+            --output json > images.json
 
-          if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "None" || "$IMAGE_ID" == "null" ]]; then
-            echo "Image Ubuntu 24.04 yang sesuai tidak ditemukan."
+          if ! jq -e '(.data | type) == "array"' images.json >/dev/null; then
+            echo "ERROR: Respons daftar image tidak valid."
+            exit 1
+          fi
+
+          IMAGE_ID=$(jq -r '
+            [
+              .data[]? |
+              select(.id != null)
+            ] |
+            sort_by(."time-created" // "") |
+            last |
+            .id // empty
+          ' images.json)
+
+          if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "null" ]]; then
+            echo "ERROR: Tidak menemukan image Ubuntu 24.04 yang cocok."
+            echo "Periksa ketersediaan image dan parameter filter OCI."
             exit 1
           fi
 
           echo "image_id=$IMAGE_ID" >> "$GITHUB_OUTPUT"
-          echo "Image Ubuntu yang sesuai ditemukan."
+          echo "Image yang cocok ditemukan."
 
       - name: Try to create VPS
         if: steps.check.outputs.exists == 'false'
@@ -115,6 +159,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -z "$OCI_SSH_PUBLIC_KEY" || -z "$OCI_SUBNET_OCID" ]]; then
+            echo "ERROR: Secret SSH public key atau subnet kosong."
+            exit 1
+          fi
+
           printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh_public_key"
           chmod 600 "$RUNNER_TEMP/ssh_public_key"
 
@@ -125,7 +174,7 @@ jobs:
           )
 
           for AD in "${ADS[@]}"; do
-            echo "Mencoba Availability Domain: $AD"
+            echo "Mencoba membuat hermes-vps di $AD..."
 
             if oci compute instance launch \
               --availability-domain "$AD" \
@@ -140,7 +189,8 @@ jobs:
               --wait-for-state RUNNING \
               --max-wait-seconds 900 \
               --output json > launch-result.json 2> launch-error.log; then
-              echo "VPS berhasil dibuat."
+
+              echo "Permintaan pembuatan VPS berhasil."
               jq '{
                 id: .data.id,
                 name: .data."display-name",
@@ -155,15 +205,19 @@ jobs:
               if ! grep -Eqi \
                 'out of host capacity|capacity.*unavailable|not available in.*availability domain' \
                 launch-error.log; then
-                echo "Kesalahan bukan masalah kapasitas yang dikenali."
+                echo "ERROR: Kegagalan bukan masalah kapasitas yang dikenali."
+                echo "Proses dihentikan agar penyebabnya dapat diperiksa."
                 exit 1
               fi
             fi
           done
 
-          echo "Kapasitas A1 belum tersedia di ketiga AD."
+          echo "Kapasitas A1 belum tersedia di ketiga Availability Domain."
           exit 1
 
       - name: VPS already exists
         if: steps.check.outputs.exists == 'true'
-        run: echo "hermes-vps sudah ada. Tidak membuat duplikat."
+        run: |
+          echo "Instance sudah ditemukan melalui API OCI."
+          echo "Tidak membuat instance duplikat."
+          echo "Periksa OCID dan status pada log Check existing instance."
