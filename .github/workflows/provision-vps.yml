@@ -1,0 +1,141 @@
+
+name: Provision Oracle VPS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Install OCI CLI and jq
+        run: |
+          python -m pip install oci-cli
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Configure OCI credentials
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_KEY_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.oci"
+          chmod 700 "$HOME/.oci"
+
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_KEY_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+
+          chmod 600 "$HOME/.oci/config"
+          oci iam availability-domain list \
+            --compartment-id "$OCI_TENANCY_OCID" \
+            --output table
+
+      - name: Check and provision VPS
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Memeriksa instance yang sudah ada..."
+          oci compute instance list \
+            --compartment-id "$OCI_TENANCY_OCID" \
+            --all --output json > instances.json
+
+          if jq -e '
+            .data[]? |
+            select(
+              ."display-name" == "hermes-vps" and
+              ."lifecycle-state" != "TERMINATED" and
+              ."lifecycle-state" != "TERMINATING"
+            )
+          ' instances.json > /dev/null; then
+            echo "hermes-vps sudah ada. Tidak membuat duplikat."
+            exit 0
+          fi
+
+          echo "Mencari image Ubuntu 24.04 untuk A1 Flex..."
+          IMAGE_ID=$(oci compute image list \
+            --compartment-id "$OCI_TENANCY_OCID" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "24.04" \
+            --shape "VM.Standard.A1.Flex" \
+            --sort-by TIMECREATED \
+            --sort-order DESC \
+            --all \
+            --query 'data[0].id' \
+            --raw-output)
+
+          if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "None" ]]; then
+            echo "Image Ubuntu yang sesuai tidak ditemukan."
+            exit 1
+          fi
+
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh_public_key"
+          chmod 600 "$RUNNER_TEMP/ssh_public_key"
+
+          ADS=(
+            "NBFs:US-ASHBURN-AD-1"
+            "NBFs:US-ASHBURN-AD-2"
+            "NBFs:US-ASHBURN-AD-3"
+          )
+
+          for AD in "${ADS[@]}"; do
+            echo "Mencoba membuat VPS di $AD..."
+
+            if oci compute instance launch \
+              --availability-domain "$AD" \
+              --compartment-id "$OCI_TENANCY_OCID" \
+              --display-name "hermes-vps" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --image-id "$IMAGE_ID" \
+              --subnet-id "$OCI_SUBNET_OCID" \
+              --assign-public-ip true \
+              --ssh-authorized-keys-file "$RUNNER_TEMP/ssh_public_key" \
+              --wait-for-state RUNNING \
+              --max-wait-seconds 900 \
+              --output json > launch-result.json 2> launch-error.log; then
+
+              echo "Instance berhasil dibuat:"
+              jq '{
+                id: .data.id,
+                name: .data."display-name",
+                state: .data."lifecycle-state",
+                availability_domain: .data."availability-domain"
+              }' launch-result.json
+              exit 0
+            else
+              echo "Percobaan di $AD gagal."
+              cat launch-error.log
+
+              if ! grep -Eqi \
+                'out of host capacity|capacity.*unavailable|not available in.*availability domain' \
+                launch-error.log; then
+                echo "Kesalahan bukan masalah kapasitas yang dikenali. Menghentikan proses untuk pemeriksaan."
+                exit 1
+              fi
+            fi
+          done
+
+          echo "Kapasitas A1 belum tersedia di ketiga AD."
+          exit 1
